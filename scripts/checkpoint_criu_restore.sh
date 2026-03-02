@@ -64,15 +64,25 @@ else
   exit 1
 fi
 
-# Remove any existing counter file so we can prove the restored process
-# writes its OWN counter (continuing from checkpoint, not starting fresh)
-rm -f "$COUNTER_FILE"
+# CRIU requires that files the process had open exist at their original paths
+# AND that their sizes match the checkpoint. Restore saved copies from the dump.
+rm -f "$COUNTER_FILE" /tmp/criu-migrator-output.log
 
-# CRIU requires that files the process had open exist at their original paths.
-# The save-side process had /tmp/criu-migrator-output.log open as stdout/stderr.
-touch /tmp/criu-migrator-output.log
-# Also ensure the counter file path is writable (CRIU will reopen it)
-touch "$COUNTER_FILE"
+if [[ -f "$DUMP_DIR/saved-output.log" ]]; then
+  cp "$DUMP_DIR/saved-output.log" /tmp/criu-migrator-output.log
+  log "Restored output log ($(wc -c < /tmp/criu-migrator-output.log) bytes)"
+else
+  touch /tmp/criu-migrator-output.log
+  warn "No saved output log in dump — created empty (may fail size check)"
+fi
+
+if [[ -f "$DUMP_DIR/saved-counter" ]]; then
+  cp "$DUMP_DIR/saved-counter" "$COUNTER_FILE"
+  log "Restored counter file ($(cat "$COUNTER_FILE"))"
+else
+  touch "$COUNTER_FILE"
+  warn "No saved counter in dump — created empty"
+fi
 
 # ── Attempt CRIU restore ─────────────────────────────────────────────
 section "Restoring process from checkpoint"

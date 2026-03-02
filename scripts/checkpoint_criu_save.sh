@@ -103,6 +103,11 @@ EOF
 # Also save the worker script in the dump dir so the restore side has it
 cp "$WORKER_SCRIPT" "$DUMP_DIR/criu_migrator.sh"
 
+# Save open files that CRIU will validate on restore (size must match exactly)
+cp /tmp/criu-migrator-output.log "$DUMP_DIR/saved-output.log" 2>/dev/null || true
+cp "$COUNTER_FILE" "$DUMP_DIR/saved-counter" 2>/dev/null || true
+log "Saved open files for restore side (CRIU validates file sizes)"
+
 # Fix permissions so artifact upload can read everything
 sudo chmod -R a+rX "$DUMP_DIR"
 
