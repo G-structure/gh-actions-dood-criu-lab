@@ -98,13 +98,23 @@ try_restore() {
   return $rc
 }
 
-# Kill any process using the original PID (cross-worker PID conflict is expected)
+# Kill any process using PIDs from the dump (cross-worker PID conflict is expected)
+# Extract PIDs from core-*.img filenames — these are the actual PIDs CRIU needs
+DUMP_PIDS=$(ls "$DUMP_DIR"/core-*.img 2>/dev/null | sed 's/.*core-//; s/\.img//' | sort -n)
+log "PIDs needed for restore: $DUMP_PIDS"
+for pid in $DUMP_PIDS; do
+  if kill -0 "$pid" 2>/dev/null; then
+    log "PID $pid is in use on this worker. Killing it to free the PID."
+    sudo kill -9 "$pid" 2>/dev/null || true
+  fi
+done
+# Also kill the worker_pid from metadata (may differ from dump PIDs if setsid was used)
 ORIG_PID=$(python3 -c "import json; print(json.load(open('$DUMP_DIR/migration-meta.json'))['worker_pid'])" 2>/dev/null || echo "")
 if [[ -n "$ORIG_PID" ]] && kill -0 "$ORIG_PID" 2>/dev/null; then
-  log "PID $ORIG_PID is in use on this worker. Killing it to free the PID."
+  log "PID $ORIG_PID (metadata) is in use. Killing it."
   sudo kill -9 "$ORIG_PID" 2>/dev/null || true
-  sleep 1
 fi
+sleep 1
 
 # Approach 1: Standard restore (may fail if PIDs conflict)
 if try_restore "standard" -D "$DUMP_DIR" --shell-job -v4 --log-file restore.log -d; then
@@ -119,17 +129,22 @@ if [[ "$RESTORE_OK" != "true" ]]; then
 fi
 
 # Approach 3: Restore into a new PID namespace (avoids PID conflicts entirely)
+# NOTE: Do NOT use -d (detach) here — if CRIU detaches inside the namespace,
+# the namespace gets torn down immediately, killing the restored process.
+# Instead, keep CRIU attached and background the whole command.
 if [[ "$RESTORE_OK" != "true" ]]; then
   log "Trying restore in a new PID namespace (unshare) …"
-  UNSHARE_RC=0
   sudo unshare --pid --fork --mount-proc criu restore \
-    -D "$DUMP_DIR" --shell-job -v4 --log-file restore.log -d 2>&1 \
-    | tee "$RESULTS_DIR/criu-cross-restore-attempt.log" || UNSHARE_RC=$?
-  if [[ $UNSHARE_RC -eq 0 ]]; then
+    -D "$DUMP_DIR" --shell-job -v4 --log-file restore.log \
+    > "$RESULTS_DIR/criu-cross-restore-attempt.log" 2>&1 &
+  UNSHARE_PID=$!
+  sleep 3
+  if kill -0 "$UNSHARE_PID" 2>/dev/null; then
     RESTORE_OK=true
-    log "Restore in new PID namespace succeeded."
+    log "Restore in new PID namespace succeeded (unshare PID $UNSHARE_PID alive)."
   else
-    warn "Restore in new PID namespace failed (exit $UNSHARE_RC)."
+    wait "$UNSHARE_PID" 2>/dev/null || true
+    warn "Restore in new PID namespace failed."
   fi
 fi
 

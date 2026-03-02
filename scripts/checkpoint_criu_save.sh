@@ -52,7 +52,8 @@ chmod +x "$WORKER_SCRIPT"
 
 # ── Start the process ────────────────────────────────────────────────
 section "Starting counter process"
-setsid "$WORKER_SCRIPT" </dev/null &>/tmp/criu-migrator-output.log &
+# Run directly (no setsid) so $! matches the actual PID CRIU will dump
+"$WORKER_SCRIPT" </dev/null &>/tmp/criu-migrator-output.log &
 WORKER_PID=$!
 add_cleanup "sudo kill $WORKER_PID 2>/dev/null || true"
 
@@ -86,10 +87,15 @@ fi
 CHECKPOINT_VALUE=$(cat "$COUNTER_FILE" 2>/dev/null || echo "unknown")
 log "Counter value at checkpoint: $CHECKPOINT_VALUE"
 
+# Extract actual PIDs from the dump (core-<PID>.img files)
+DUMP_PIDS=$(ls "$DUMP_DIR"/core-*.img 2>/dev/null | sed 's/.*core-//; s/\.img//' | sort -n | paste -sd, -)
+log "PIDs in dump: $DUMP_PIDS"
+
 cat > "$DUMP_DIR/migration-meta.json" <<EOF
 {
   "counter_at_checkpoint": $CHECKPOINT_VALUE,
   "worker_pid": $WORKER_PID,
+  "dump_pids": [$DUMP_PIDS],
   "worker_script": "$WORKER_SCRIPT",
   "counter_file": "$COUNTER_FILE",
   "source_hostname": "$(hostname)",
