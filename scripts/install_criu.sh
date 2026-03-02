@@ -31,20 +31,9 @@ install_from_ppa() {
   retry 3 sudo apt-get install -y criu
 }
 
-# On 24.04+ the package is missing from default repos; use PPA
-case "$UBUNTU_VERSION" in
-  22.04*)
-    install_from_apt || install_from_ppa
-    ;;
-  24.04*|25.*|26.*)
-    log "Ubuntu $UBUNTU_VERSION — criu not in default repos, using PPA."
-    install_from_ppa
-    ;;
-  *)
-    # Try direct first, fall back to PPA
-    install_from_apt || install_from_ppa
-    ;;
-esac
+# Always prefer PPA for latest CRIU (3.16.1 from 22.04 repos segfaults with newer kernels)
+log "Installing CRIU from PPA (recommended for all Ubuntu versions) …"
+install_from_ppa || install_from_apt
 
 if command -v criu &>/dev/null; then
   ok "CRIU installed: $(criu --version 2>&1 | head -1)"

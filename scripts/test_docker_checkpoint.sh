@@ -16,10 +16,7 @@ section "Docker Checkpoint/Restore Test"
 print_env
 
 CONTAINER_NAME="docker-ckpt-test-$$"
-CKPT_DIR="/tmp/docker-ckpt-dir-$$"
-mkdir -p "$CKPT_DIR"
 add_cleanup "docker rm -f $CONTAINER_NAME 2>/dev/null || true"
-add_cleanup "rm -rf $CKPT_DIR"
 
 # ── Step 1: Install CRIU on host ─────────────────────────────────────
 bash "$SCRIPT_DIR/install_criu.sh"
@@ -92,10 +89,6 @@ docker info 2>&1 | grep -iE "experimental|server version|storage driver|cgroup" 
 EXPERIMENTAL=$(docker info --format '{{.ExperimentalBuild}}' 2>/dev/null || echo "unknown")
 log "Experimental enabled: $EXPERIMENTAL"
 
-if [[ "$EXPERIMENTAL" != "true" ]]; then
-  warn "Experimental features not enabled. Docker checkpoint may not work."
-fi
-
 # ── Step 4: Check CRIU + runtime compatibility ───────────────────────
 section "Checking runtime compatibility"
 log "Default runtime: $(docker info --format '{{.DefaultRuntime}}' 2>/dev/null || echo unknown)"
@@ -103,21 +96,24 @@ log "runc version:"
 runc --version 2>/dev/null || sudo runc --version 2>/dev/null || true
 log "criu version:"
 criu --version 2>/dev/null || true
-log "criu check:"
-sudo criu check 2>&1 | tail -5 || true
 
-# ── Step 5: Start test container ─────────────────────────────────────
-section "Starting test container"
+# ── Step 5: Full checkpoint/restore attempt ──────────────────────────
+# Try multiple container configurations; for each one, attempt checkpoint + restore.
+# The key issue: containerd v2 does NOT support --checkpoint-dir, so we must use
+# Docker's built-in checkpoint storage. Also work around moby/moby#42900 by purging
+# stale content blobs from the containerd moby namespace before restoring.
 
-# Try progressively more permissive settings
-CONTAINER_STARTED=false
-CONTAINER_OPTS_USED=""
+OVERALL_PASS=false
 
-start_test_container() {
+attempt_full_cycle() {
   local desc="$1"; shift
-  log "Starting container ($desc) …"
+  local container_opts=("$@")
+
+  section "Attempt: $desc"
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  if docker run -d --name "$CONTAINER_NAME" "$@" \
+
+  log "Starting container ($desc) …"
+  if ! docker run -d --name "$CONTAINER_NAME" "${container_opts[@]}" \
       alpine:3.19 sh -c '
         i=0
         while true; do
@@ -127,235 +123,113 @@ start_test_container() {
           sleep 1
         done
       '; then
-    CONTAINER_STARTED=true
-    CONTAINER_OPTS_USED="$desc"
+    warn "Could not start container ($desc)."
+    return 1
+  fi
+
+  ok "Container started ($desc)."
+  sleep 5
+
+  PRE_VALUE=$(docker exec "$CONTAINER_NAME" cat /tmp/counter 2>/dev/null || echo "unknown")
+  log "Counter before checkpoint: $PRE_VALUE"
+
+  # Create checkpoint (no --checkpoint-dir; use Docker default storage)
+  log "Creating checkpoint …"
+  if ! docker checkpoint create "$CONTAINER_NAME" cp1 2>&1 | tee "$RESULTS_DIR/docker-ckpt-attempt.log"; then
+    warn "Checkpoint creation failed ($desc)."
+    cat "$RESULTS_DIR/docker-ckpt-attempt.log" >> "$RESULTS_DIR/docker-ckpt-all-attempts.log" 2>/dev/null || true
+    return 1
+  fi
+  ok "Checkpoint created."
+
+  # Workaround for moby/moby#42900: purge stale content blobs
+  log "Purging stale containerd content (moby#42900 workaround) …"
+  STALE=$(sudo ctr -n moby content ls -q 2>/dev/null || true)
+  if [[ -n "$STALE" ]]; then
+    while IFS= read -r blob; do
+      [[ -n "$blob" ]] && { log "  Removing: $blob"; sudo ctr -n moby content rm "$blob" 2>/dev/null || true; }
+    done <<< "$STALE"
+  fi
+
+  # Restore
+  log "Restoring from checkpoint …"
+  if ! docker start --checkpoint cp1 "$CONTAINER_NAME" 2>&1 | tee "$RESULTS_DIR/docker-restore.log"; then
+    warn "Restore failed ($desc)."
+    cat "$RESULTS_DIR/docker-restore.log" >> "$RESULTS_DIR/docker-restore-all.log" 2>/dev/null || true
+    return 1
+  fi
+  ok "Restore succeeded ($desc)!"
+
+  # Verify state continuity
+  sleep 4
+  POST_VALUE=$(docker exec "$CONTAINER_NAME" cat /tmp/counter 2>/dev/null || echo "unknown")
+  log "Counter after restore: $POST_VALUE"
+
+  if [[ "$POST_VALUE" != "unknown" && "$PRE_VALUE" != "unknown" ]] && (( POST_VALUE > PRE_VALUE )); then
+    ok "State continuity verified: counter $PRE_VALUE -> $POST_VALUE ($desc)"
+    record_result "$TEST_NAME" "PASS" "Counter $PRE_VALUE -> $POST_VALUE ($desc)."
+    append_summary "| Docker checkpoint | :white_check_mark: PASS | Counter $PRE_VALUE -> $POST_VALUE ($desc) |"
+    OVERALL_PASS=true
     return 0
   else
+    warn "Counter did not advance: $PRE_VALUE -> $POST_VALUE ($desc)"
     return 1
   fi
 }
 
-# Escalating privilege levels
-start_test_container "minimal" || \
-start_test_container "seccomp=unconfined" \
-     --security-opt seccomp=unconfined || \
-start_test_container "seccomp+apparmor=unconfined" \
-     --security-opt seccomp=unconfined \
-     --security-opt apparmor=unconfined || \
-start_test_container "with capabilities" \
-     --security-opt seccomp=unconfined \
-     --security-opt apparmor=unconfined \
-     --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE || \
-start_test_container "privileged (last resort)" --privileged || true
+# Attempt 1: minimal
+attempt_full_cycle "minimal" || true
 
-if [[ "$CONTAINER_STARTED" != "true" ]]; then
-  fail "Could not start test container with any privilege level."
-  record_result "$TEST_NAME" "FAIL" "Could not start test container."
-  append_summary "| Docker checkpoint | :x: FAIL | Could not start test container |"
-  exit 1
+# Attempt 2: seccomp=unconfined
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  attempt_full_cycle "seccomp=unconfined" \
+    --security-opt seccomp=unconfined || true
 fi
 
-ok "Container started ($CONTAINER_OPTS_USED)."
-sleep 5  # Let counter tick
-
-log "Container logs before checkpoint:"
-docker logs "$CONTAINER_NAME" 2>&1 | tail -10
-
-PRE_VALUE=$(docker exec "$CONTAINER_NAME" cat /tmp/counter 2>/dev/null || echo "unknown")
-log "Counter value before checkpoint: $PRE_VALUE"
-
-# ── Step 6: Create checkpoint ────────────────────────────────────────
-section "Creating Docker checkpoint"
-
-CKPT_OK=false
-
-create_checkpoint() {
-  local desc="$1"; shift
-  log "Trying checkpoint ($desc) …"
-  local rc=0
-  docker checkpoint create "$@" "$CONTAINER_NAME" cp1 2>&1 | tee "$RESULTS_DIR/docker-ckpt-attempt.log" || rc=$?
-  if [[ $rc -eq 0 ]]; then
-    return 0
-  else
-    warn "Checkpoint failed ($desc), exit $rc"
-    cat "$RESULTS_DIR/docker-ckpt-attempt.log" >> "$RESULTS_DIR/docker-ckpt-all-attempts.log" 2>/dev/null || true
-    return $rc
-  fi
-}
-
-# Try with external checkpoint directory to avoid containerd content-store collision
-if create_checkpoint "with --checkpoint-dir" --checkpoint-dir="$CKPT_DIR"; then
-  CKPT_OK=true
+# Attempt 3: seccomp+apparmor unconfined
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  attempt_full_cycle "seccomp+apparmor=unconfined" \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined || true
 fi
 
-# Fallback: try default location
-if [[ "$CKPT_OK" != "true" ]]; then
-  docker start "$CONTAINER_NAME" 2>/dev/null || true
-  sleep 2
-  if create_checkpoint "default location"; then
-    CKPT_OK=true
-  fi
+# Attempt 4: with capabilities
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  attempt_full_cycle "with SYS_ADMIN+SYS_PTRACE" \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE || true
 fi
 
-# If both failed, try with privileged container
-if [[ "$CKPT_OK" != "true" && "$CONTAINER_OPTS_USED" != *"privileged"* ]]; then
-  log "Retrying with privileged container …"
-  docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  if start_test_container "privileged (retry)" --privileged; then
-    sleep 5
-    if create_checkpoint "privileged + checkpoint-dir" --checkpoint-dir="$CKPT_DIR"; then
-      CKPT_OK=true
-    fi
-  fi
+# Attempt 5: net=host (workaround for containerd#12141 netns issue)
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  attempt_full_cycle "net=host + seccomp=unconfined" \
+    --net=host \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined || true
 fi
 
-if [[ "$CKPT_OK" != "true" ]]; then
-  fail "Docker checkpoint creation failed."
-  log "Docker daemon logs (last 50 lines):"
-  sudo journalctl -u docker --no-pager -n 50 2>/dev/null | tee "$RESULTS_DIR/docker-daemon.log" || true
-  log "CRIU check output:"
-  sudo criu check 2>&1 | tee -a "$RESULTS_DIR/criu-check-docker.log" || true
-
-  CKPT_ERROR=$(cat "$RESULTS_DIR/docker-ckpt-all-attempts.log" 2>/dev/null | tail -5 || echo "See logs")
-  record_result "$TEST_NAME" "FAIL" "Docker checkpoint create failed: $CKPT_ERROR"
-  append_summary "| Docker checkpoint | :x: FAIL | Checkpoint creation failed — see logs |"
-  exit 1
+# Attempt 6: fully privileged
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  attempt_full_cycle "privileged" --privileged || true
 fi
 
-ok "Docker checkpoint created!"
-
-# ── Step 7: Restore from checkpoint ──────────────────────────────────
-section "Restoring from checkpoint"
-
-log "Container status after checkpoint:"
-docker ps -a --filter "name=$CONTAINER_NAME" --format '{{.Status}}' || true
-
-# Workaround for "content sha256:... already exists" bug (moby/moby#42900):
-# Purge any stale content blobs from containerd's moby namespace
-log "Purging stale containerd content blobs (workaround for moby#42900) …"
-STALE_BLOBS=$(sudo ctr -n moby content ls -q 2>/dev/null || true)
-if [[ -n "$STALE_BLOBS" ]]; then
-  while IFS= read -r blob; do
-    log "  Removing content: $blob"
-    sudo ctr -n moby content rm "$blob" 2>/dev/null || true
-  done <<< "$STALE_BLOBS"
+# Attempt 7: privileged + net=host
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  attempt_full_cycle "privileged + net=host" --privileged --net=host || true
 fi
 
-RESTORE_OK=false
-RESTORE_ERROR=""
+if [[ "$OVERALL_PASS" != "true" ]]; then
+  fail "Docker checkpoint/restore failed after all approaches."
+  log "Docker daemon logs (last 80 lines):"
+  sudo journalctl -u docker --no-pager -n 80 2>/dev/null | tee "$RESULTS_DIR/docker-daemon.log" || true
+  log "All restore attempts:"
+  cat "$RESULTS_DIR/docker-restore-all.log" 2>/dev/null || true
+  log "All checkpoint attempts:"
+  cat "$RESULTS_DIR/docker-ckpt-all-attempts.log" 2>/dev/null || true
 
-# Try restore with --checkpoint-dir if we used it for create
-if [[ -d "$CKPT_DIR/cp1" ]]; then
-  log "Restoring with --checkpoint-dir=$CKPT_DIR …"
-  if docker start --checkpoint cp1 --checkpoint-dir="$CKPT_DIR" "$CONTAINER_NAME" 2>&1 | tee "$RESULTS_DIR/docker-restore.log"; then
-    RESTORE_OK=true
-  else
-    RESTORE_ERROR=$(cat "$RESULTS_DIR/docker-restore.log" 2>/dev/null | tail -3)
-    warn "Restore with checkpoint-dir failed: $RESTORE_ERROR"
-  fi
-fi
-
-# Try default restore
-if [[ "$RESTORE_OK" != "true" ]]; then
-  log "Trying default restore …"
-  if docker start --checkpoint cp1 "$CONTAINER_NAME" 2>&1 | tee "$RESULTS_DIR/docker-restore.log"; then
-    RESTORE_OK=true
-  else
-    RESTORE_ERROR=$(cat "$RESULTS_DIR/docker-restore.log" 2>/dev/null | tail -3)
-    warn "Default restore failed: $RESTORE_ERROR"
-  fi
-fi
-
-# If still failing, try recreating with --net=host (workaround for containerd#12141)
-if [[ "$RESTORE_OK" != "true" ]]; then
-  log "Retrying entire flow with --net=host (workaround for containerd netns issue) …"
-  docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  rm -rf "$CKPT_DIR"/*
-
-  NET_HOST_OPTS=(--net=host --security-opt seccomp=unconfined --security-opt apparmor=unconfined)
-  if start_test_container "net=host + seccomp=unconfined" "${NET_HOST_OPTS[@]}"; then
-    sleep 5
-    PRE_VALUE=$(docker exec "$CONTAINER_NAME" cat /tmp/counter 2>/dev/null || echo "unknown")
-    log "Counter before checkpoint (net=host attempt): $PRE_VALUE"
-
-    if create_checkpoint "net=host + checkpoint-dir" --checkpoint-dir="$CKPT_DIR"; then
-      # Purge containerd content again
-      STALE=$(sudo ctr -n moby content ls -q 2>/dev/null || true)
-      while IFS= read -r blob; do
-        [[ -n "$blob" ]] && sudo ctr -n moby content rm "$blob" 2>/dev/null || true
-      done <<< "$STALE"
-
-      if docker start --checkpoint cp1 --checkpoint-dir="$CKPT_DIR" "$CONTAINER_NAME" 2>&1 | tee "$RESULTS_DIR/docker-restore.log"; then
-        RESTORE_OK=true
-      fi
-    fi
-  fi
-fi
-
-# Last resort: privileged + net=host
-if [[ "$RESTORE_OK" != "true" ]]; then
-  log "Last resort: privileged + net=host …"
-  docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-  rm -rf "$CKPT_DIR"/*
-
-  if start_test_container "privileged + net=host" --privileged --net=host; then
-    sleep 5
-    PRE_VALUE=$(docker exec "$CONTAINER_NAME" cat /tmp/counter 2>/dev/null || echo "unknown")
-    log "Counter before checkpoint (privileged+net=host): $PRE_VALUE"
-
-    if create_checkpoint "privileged + net=host + checkpoint-dir" --checkpoint-dir="$CKPT_DIR"; then
-      STALE=$(sudo ctr -n moby content ls -q 2>/dev/null || true)
-      while IFS= read -r blob; do
-        [[ -n "$blob" ]] && sudo ctr -n moby content rm "$blob" 2>/dev/null || true
-      done <<< "$STALE"
-
-      if docker start --checkpoint cp1 --checkpoint-dir="$CKPT_DIR" "$CONTAINER_NAME" 2>&1 | tee "$RESULTS_DIR/docker-restore.log"; then
-        RESTORE_OK=true
-      fi
-    fi
-  fi
-fi
-
-if [[ "$RESTORE_OK" != "true" ]]; then
-  fail "Docker restore failed after all approaches."
-  log "Docker daemon logs (last 60 lines):"
-  sudo journalctl -u docker --no-pager -n 60 2>/dev/null | tee "$RESULTS_DIR/docker-daemon.log" || true
-  log "Last restore attempt output:"
-  cat "$RESULTS_DIR/docker-restore.log" 2>/dev/null || true
-
-  record_result "$TEST_NAME" "FAIL" "Docker checkpoint restore failed: ${RESTORE_ERROR:-see logs}"
-  append_summary "| Docker checkpoint | :x: FAIL | Restore from checkpoint failed — see logs |"
-  exit 1
-fi
-
-ok "Restore succeeded!"
-
-# ── Step 8: Verify state continuity ──────────────────────────────────
-section "Verifying state continuity"
-sleep 4
-
-POST_VALUE=$(docker exec "$CONTAINER_NAME" cat /tmp/counter 2>/dev/null || echo "unknown")
-log "Counter after restore: $POST_VALUE"
-
-log "Container logs after restore (last 10):"
-docker logs "$CONTAINER_NAME" 2>&1 | tail -10
-
-if [[ "$POST_VALUE" != "unknown" && "$PRE_VALUE" != "unknown" ]]; then
-  if (( POST_VALUE > PRE_VALUE )); then
-    ok "State continuity verified: counter $PRE_VALUE -> $POST_VALUE"
-    record_result "$TEST_NAME" "PASS" "Counter went from $PRE_VALUE to $POST_VALUE after restore."
-    append_summary "| Docker checkpoint | :white_check_mark: PASS | Counter $PRE_VALUE -> $POST_VALUE |"
-  else
-    fail "Counter did not advance: $PRE_VALUE -> $POST_VALUE"
-    record_result "$TEST_NAME" "FAIL" "Counter did not advance ($PRE_VALUE -> $POST_VALUE)."
-    append_summary "| Docker checkpoint | :x: FAIL | Counter stalled ($PRE_VALUE -> $POST_VALUE) |"
-    exit 1
-  fi
-else
-  warn "Could not verify counter (pre=$PRE_VALUE, post=$POST_VALUE)"
-  record_result "$TEST_NAME" "FAIL" "Could not read counter after restore."
-  append_summary "| Docker checkpoint | :x: FAIL | Could not read counter after restore |"
-  exit 1
+  record_result "$TEST_NAME" "FAIL" "Docker checkpoint/restore failed — see logs for details."
+  append_summary "| Docker checkpoint | :x: FAIL | All checkpoint/restore approaches failed — see logs |"
 fi
 
 # Cleanup
