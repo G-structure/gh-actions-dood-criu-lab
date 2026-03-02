@@ -1,0 +1,231 @@
+name: Cross-Worker Checkpoint Migration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════
+  # Phase 1: CRIU — checkpoint a process and upload dump as artifact
+  # ═══════════════════════════════════════════════════════════════════
+  criu-save:
+    name: "CRIU Save (checkpoint)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          mkdir -p results
+          echo '[]' > results/results.json
+          echo "# Cross-Worker Results — $(date -u)" > results/summary.md
+          echo "" >> results/summary.md
+          echo "| Test | Result | Details |" >> results/summary.md
+          echo "|------|--------|---------|" >> results/summary.md
+          chmod +x scripts/*.sh
+
+      - name: "CRIU: Checkpoint process"
+        run: bash scripts/checkpoint_criu_save.sh
+        continue-on-error: true
+
+      - name: Fix permissions
+        if: always()
+        run: sudo chmod -R a+rX results/ 2>/dev/null || true
+
+      - name: Upload CRIU dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criu-checkpoint-dump
+          path: results/criu-migration-dump/
+          retention-days: 1
+
+      - name: Upload save logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criu-save-results
+          path: results/
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Phase 2: CRIU — download dump on a DIFFERENT worker and restore
+  # ═══════════════════════════════════════════════════════════════════
+  criu-restore:
+    name: "CRIU Restore (different worker)"
+    needs: criu-save
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          mkdir -p results/criu-migration-dump
+          echo '[]' > results/results.json
+          echo "# Cross-Worker Restore Results — $(date -u)" > results/summary.md
+          echo "" >> results/summary.md
+          echo "| Test | Result | Details |" >> results/summary.md
+          echo "|------|--------|---------|" >> results/summary.md
+          chmod +x scripts/*.sh
+
+      - name: Download CRIU dump from save job
+        uses: actions/download-artifact@v4
+        with:
+          name: criu-checkpoint-dump
+          path: results/criu-migration-dump/
+
+      - name: Show downloaded dump
+        run: |
+          echo "Downloaded dump contents:"
+          ls -laR results/criu-migration-dump/
+          echo "Dump size: $(du -sh results/criu-migration-dump/ | cut -f1)"
+
+      - name: "CRIU: Restore process on new worker"
+        run: bash scripts/checkpoint_criu_restore.sh
+        continue-on-error: true
+
+      - name: Fix permissions
+        if: always()
+        run: sudo chmod -R a+rX results/ 2>/dev/null || true
+
+      - name: Upload restore results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criu-restore-results
+          path: results/
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## CRIU Cross-Worker Checkpoint Migration"
+            echo ""
+            if command -v jq &>/dev/null && [[ -f results/results.json ]]; then
+              echo "| Test | Result | Details |"
+              echo "|------|--------|---------|"
+              jq -r '.[] | "| \(.test) | \(.status) | \(.message) |"' results/results.json
+            fi
+            echo ""
+            echo "### Environment"
+            echo '```'
+            echo "Restore worker: $(hostname)"
+            uname -a
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Phase 1: Docker — checkpoint a container and export data
+  # ═══════════════════════════════════════════════════════════════════
+  docker-save:
+    name: "Docker Save (checkpoint)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          mkdir -p results
+          echo '[]' > results/results.json
+          echo "# Docker Cross-Worker — $(date -u)" > results/summary.md
+          echo "" >> results/summary.md
+          echo "| Test | Result | Details |" >> results/summary.md
+          echo "|------|--------|---------|" >> results/summary.md
+          chmod +x scripts/*.sh
+
+      - name: "Docker: Checkpoint container"
+        run: bash scripts/checkpoint_docker_save.sh
+        continue-on-error: true
+
+      - name: Fix permissions
+        if: always()
+        run: sudo chmod -R a+rX results/ 2>/dev/null || true
+
+      - name: Upload Docker checkpoint export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-checkpoint-export
+          path: results/docker-migration-export/
+          retention-days: 1
+
+      - name: Upload save logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-save-results
+          path: results/
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Phase 2: Docker — download export on a DIFFERENT worker and restore
+  # ═══════════════════════════════════════════════════════════════════
+  docker-restore:
+    name: "Docker Restore (different worker)"
+    needs: docker-save
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          mkdir -p results/docker-migration-export
+          echo '[]' > results/results.json
+          echo "# Docker Cross-Worker Restore — $(date -u)" > results/summary.md
+          echo "" >> results/summary.md
+          echo "| Test | Result | Details |" >> results/summary.md
+          echo "|------|--------|---------|" >> results/summary.md
+          chmod +x scripts/*.sh
+
+      - name: Download Docker checkpoint export
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-checkpoint-export
+          path: results/docker-migration-export/
+
+      - name: Show downloaded export
+        run: |
+          echo "Downloaded export contents:"
+          ls -laR results/docker-migration-export/
+          echo "Export size: $(du -sh results/docker-migration-export/ | cut -f1)"
+
+      - name: "Docker: Restore container on new worker"
+        run: bash scripts/checkpoint_docker_restore.sh
+        continue-on-error: true
+
+      - name: Fix permissions
+        if: always()
+        run: sudo chmod -R a+rX results/ 2>/dev/null || true
+
+      - name: Upload restore results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-restore-results
+          path: results/
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Docker Cross-Worker Checkpoint Migration"
+            echo ""
+            if command -v jq &>/dev/null && [[ -f results/results.json ]]; then
+              echo "| Test | Result | Details |"
+              echo "|------|--------|---------|"
+              jq -r '.[] | "| \(.test) | \(.status) | \(.message) |"' results/results.json
+            fi
+            echo ""
+            echo "### Environment"
+            echo '```'
+            echo "Restore worker: $(hostname)"
+            uname -a
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
