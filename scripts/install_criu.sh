@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# install_criu.sh — Install CRIU on Ubuntu (handles 22.04 and 24.04+)
+# install_criu.sh — Install CRIU 4.2 from the official PPA (ppa:criu/ppa).
+#
+# Always prefers the PPA over distro packages because:
+#   - Ubuntu 24.04 removed criu from repos entirely (LP Bug #2066148)
+#   - Ubuntu 22.04 ships CRIU 3.16.1, which segfaults on Azure's 6.8 kernel
+# Falls back to direct `apt install` if the PPA fails.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -31,7 +36,7 @@ install_from_ppa() {
   retry 3 sudo apt-get install -y criu
 }
 
-# Always prefer PPA for latest CRIU (3.16.1 from 22.04 repos segfaults with newer kernels)
+# PPA provides CRIU 4.2; stock 22.04 has 3.16.1 which segfaults on Azure 6.8 kernel
 log "Installing CRIU from PPA (recommended for all Ubuntu versions) …"
 install_from_ppa || install_from_apt
 

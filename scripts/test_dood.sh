@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# test_dood.sh — Docker-out-of-Docker test
+# test_dood.sh — Docker-out-of-Docker (DOOD) test.
 #
-# Runs a Docker CLI container that talks to the host daemon via the
-# mounted /var/run/docker.sock, proving sibling-container creation.
+# Verifies that mounting /var/run/docker.sock into a container lets the
+# inner Docker CLI talk to the host daemon and create sibling containers
+# visible on the host. Works on all GitHub-hosted runners with no special config.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"

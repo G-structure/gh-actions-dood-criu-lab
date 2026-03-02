@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
-# checkpoint_docker_restore.sh — Restore a Docker container checkpoint
-# that was exported from another worker.
+# checkpoint_docker_restore.sh — Docker cross-worker migration: RESTORE phase.
+#
+# Expects the export directory (uploaded as artifact by the save job) to be
+# already downloaded at $RESULTS_DIR/docker-migration-export/. The workflow
+# handles the artifact download before running this script.
+#
+# Restore methods (tried in order):
+#   1. ctr containerd restore — if a ctr-checkpoint.tar exists
+#   2. Raw checkpoint data import — creates a container with the same
+#      image/config, stops it, copies checkpoint files from the export
+#      into Docker's internal checkpoint directory, purges stale containerd
+#      content blobs (moby#42900 workaround), restores via `docker start --checkpoint`
+#   3. Filesystem-only import — `docker import` of container-fs.tar, then
+#      starts a new container that reads the counter from the imported FS.
+#      This preserves file state but NOT process state (qualified fallback).
+#
+# Method 2 is what currently works on GitHub-hosted runners.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -71,7 +86,7 @@ section "Attempting cross-worker Docker checkpoint restore"
 
 RESTORE_OK=false
 
-# Method 1: Import via ctr checkpoint restore if we have a ctr-checkpoint.tar
+# Method 1: containerd checkpoint restore (requires ctr-checkpoint.tar from save)
 if [[ -f "$EXPORT_DIR/ctr-checkpoint.tar" ]]; then
   log "Found ctr checkpoint tar. Attempting containerd restore …"
 
@@ -98,7 +113,10 @@ if [[ -f "$EXPORT_DIR/ctr-checkpoint.tar" ]]; then
   docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 fi
 
-# Method 2: Import content blobs and try docker checkpoint restore
+# Method 2: Raw checkpoint data import (the method that works on GitHub runners).
+# Strategy: create a container with the same image/config, stop it, inject the
+# raw checkpoint files into Docker's internal checkpoint directory, purge stale
+# containerd content blobs (moby#42900 workaround), then restore.
 if [[ "$RESTORE_OK" != "true" && -d "$EXPORT_DIR/content-blobs" ]]; then
   log "Trying to import content blobs and restore …"
 
@@ -153,7 +171,7 @@ if [[ "$RESTORE_OK" != "true" && -d "$EXPORT_DIR/content-blobs" ]]; then
   fi
 fi
 
-# Method 3: Filesystem-only restore (not a true checkpoint restore, but shows the concept)
+# Method 3: Filesystem-only restore (fallback — preserves file state but NOT process state)
 if [[ "$RESTORE_OK" != "true" && -f "$EXPORT_DIR/container-fs.tar" ]]; then
   log "True cross-worker Docker checkpoint restore not possible with current containerd."
   log "The checkpoint data is tied to the specific container ID and containerd instance."

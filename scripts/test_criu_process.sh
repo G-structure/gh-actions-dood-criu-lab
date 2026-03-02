@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# test_criu_process.sh — CRIU direct process checkpoint/restore test
+# test_criu_process.sh — CRIU direct process checkpoint/restore (same worker).
 #
-# Attempts to checkpoint a running host process with CRIU and restore it,
-# verifying state continuity (counter resumes, doesn't restart at 0).
+# Starts a counter process, checkpoints it with `criu dump`, verifies the
+# process was killed, restores it with `criu restore`, and confirms the
+# counter resumes from the checkpoint value (not from 0).
+#
+# Tries progressively more permissive CRIU flags if standard dump fails.
+# Requires CRIU 4.2 from PPA — see install_criu.sh.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -44,8 +48,8 @@ lsmod 2>/dev/null | grep -iE 'criu|checkpoint|netns' || log "(none found)"
 # ── Step 3: Start demo process ───────────────────────────────────────
 section "Starting counter process"
 
-# Use a simple shell loop that writes counter to a file.
-# Run it in its own process group via setsid so CRIU can dump the tree.
+# Simple shell loop that writes a counter to a file every second.
+# setsid creates a clean session for the process tree.
 cat > /tmp/criu_counter_worker.sh <<'WORKER'
 #!/bin/bash
 counter=0
@@ -58,7 +62,8 @@ done
 WORKER
 chmod +x /tmp/criu_counter_worker.sh
 
-# Launch as a background process. We use setsid for a clean session.
+# Launch in background with setsid. For same-worker tests setsid is fine;
+# the cross-worker scripts avoid setsid to prevent PID mismatch issues.
 setsid /tmp/criu_counter_worker.sh "$COUNTER_FILE" </dev/null &>/tmp/criu-worker-output.log &
 WORKER_PID=$!
 echo "$WORKER_PID" > "$WORKER_PIDFILE"

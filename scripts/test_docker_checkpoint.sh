@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# test_docker_checkpoint.sh — Docker checkpoint/restore (docker + CRIU) test
+# test_docker_checkpoint.sh — Docker checkpoint/restore on the same worker.
 #
-# Tests whether the Docker daemon on GitHub-hosted runners supports
-# `docker checkpoint create` / `docker start --checkpoint` (requires
-# Docker experimental features + CRIU).
+# Tests `docker checkpoint create` / `docker start --checkpoint` with
+# progressively more permissive container configurations until one works.
+# Requires Docker experimental features + CRIU installed on the host.
+#
+# Working configuration on GitHub runners:
+#   --net=host --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+# Plus containerd content blob purge before restore (moby#42900 workaround).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -97,11 +101,12 @@ runc --version 2>/dev/null || sudo runc --version 2>/dev/null || true
 log "criu version:"
 criu --version 2>/dev/null || true
 
-# ── Step 5: Full checkpoint/restore attempt ──────────────────────────
-# Try multiple container configurations; for each one, attempt checkpoint + restore.
-# The key issue: containerd v2 does NOT support --checkpoint-dir, so we must use
-# Docker's built-in checkpoint storage. Also work around moby/moby#42900 by purging
-# stale content blobs from the containerd moby namespace before restoring.
+# ── Step 5: Full checkpoint/restore cycle ─────────────────────────────
+# Try progressively more permissive container configs. For each one, start
+# a container, checkpoint it, purge stale containerd content blobs
+# (moby#42900 workaround), restore, and verify counter continuity.
+# We use Docker's built-in checkpoint storage (containerd v2 does NOT
+# support --checkpoint-dir).
 
 OVERALL_PASS=false
 

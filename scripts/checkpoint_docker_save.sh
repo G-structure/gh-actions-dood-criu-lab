@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
-# checkpoint_docker_save.sh — Create a Docker container checkpoint and
-# export it as a tar for cross-worker migration.
+# checkpoint_docker_save.sh — Docker cross-worker migration: SAVE phase.
 #
-# Since containerd v2 doesn't support --checkpoint-dir for restore,
-# we export the checkpoint data from containerd's content store.
+# Starts a container with a stateful counter, checkpoints it with
+# `docker checkpoint create`, then exports everything the restore side
+# needs. The export directory is uploaded as a GitHub Actions artifact.
+#
+# Export strategy (multiple methods, in priority order):
+#   1. ctr checkpoint — export via containerd CLI (full checkpoint tar)
+#   2. Raw checkpoint files — copy from /var/lib/docker/containers/<id>/checkpoints/cp1/
+#   3. Containerd content blobs — export from `ctr -n moby content`
+#   4. docker export — filesystem-only fallback (no process state)
+#
+# The container must be started with --net=host because default bridge
+# networking causes netns bind-mount failures on restore (containerd#12141).
+# Security opts seccomp=unconfined and apparmor=unconfined are also required.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -41,7 +51,10 @@ sudo systemctl restart docker
 for i in $(seq 1 30); do docker info &>/dev/null && break; sleep 1; done
 ok "Docker restarted with experimental."
 
-# ── Start container with --net=host (required for checkpoint) ────────
+# ── Start container ────────────────────────────────────────────────
+# --net=host is required: default bridge networking fails on restore with
+# "bind-mount /proc/0/ns/net -> .../netns/<ID>: no such file or directory"
+# (containerd#12141). Security opts relax seccomp/apparmor for CRIU access.
 section "Starting test container"
 docker run -d --name "$CONTAINER_NAME" \
   --net=host \
@@ -78,9 +91,12 @@ else
 fi
 
 # ── Export checkpoint data ───────────────────────────────────────────
+# Docker stores checkpoints internally in containerd's content store, tied to
+# the specific container ID. There is no `docker checkpoint export` command.
+# We try multiple extraction methods to capture the data for the restore side.
 section "Exporting checkpoint data"
 
-# Method 1: Try to find checkpoint in containerd content store and export
+# Method 1: Try containerd CLI to export the full checkpoint
 log "Listing containerd content in moby namespace …"
 CONTENT_LIST=$(sudo ctr -n moby content ls 2>/dev/null || true)
 log "Content store entries:"
@@ -134,7 +150,8 @@ else
 fi
 
 # ── Save metadata ────────────────────────────────────────────────────
-# Save the image name so the restore side can pull it
+# The restore side needs the image name, container config, and source info
+# to recreate a compatible container and apply the checkpoint data.
 CONTAINER_IMAGE=$(docker inspect "$CONTAINER_NAME" --format '{{.Config.Image}}')
 CONTAINER_CMD=$(docker inspect "$CONTAINER_NAME" --format '{{json .Config.Cmd}}')
 

@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
-# checkpoint_criu_save.sh — Start a process, let it run, checkpoint it,
-# and prepare the dump directory for upload as an artifact.
+# checkpoint_criu_save.sh — CRIU cross-worker migration: SAVE phase.
 #
-# The restored process needs:
-#   - Same binary at the same path (/tmp/criu_migrator.sh)
-#   - Compatible kernel
-#   - CRIU installed
+# Starts a stateful counter process, checkpoints it with CRIU, and
+# packages everything the restore side needs into a dump directory:
+#   - CRIU dump images (core-*.img, pages-*.img, pstree.img, etc.)
+#   - The worker script (must be placed at the same path on restore)
+#   - Open files with exact byte sizes (CRIU validates sizes on restore)
+#   - Migration metadata JSON (counter value, PIDs, hostname, kernel)
+#
+# The dump directory is uploaded as a GitHub Actions artifact by the
+# workflow, then downloaded on a different runner for restore.
+#
+# Important: the process is run directly (no setsid) so that $! captures
+# the actual PID that CRIU dumps. Using setsid causes a fork, making $!
+# point to the wrong PID — the dump then contains different PIDs than
+# metadata reports, and the restore side kills the wrong processes.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -27,7 +36,9 @@ add_cleanup "rm -f $COUNTER_FILE /tmp/criu-migrator-output.log"
 # ── Install CRIU ─────────────────────────────────────────────────────
 bash "$SCRIPT_DIR/install_criu.sh"
 
-# ── Create the worker script (must be at same path on restore side) ──
+# ── Create the worker script ────────────────────────────────────────
+# Must exist at the same absolute path on the restore side because CRIU
+# records the path of the executable in the dump images.
 section "Creating worker process"
 cat > "$WORKER_SCRIPT" <<'WORKER'
 #!/bin/bash
@@ -106,10 +117,13 @@ cat > "$DUMP_DIR/migration-meta.json" <<EOF
 }
 EOF
 
-# Also save the worker script in the dump dir so the restore side has it
+# Include the worker script so the restore side can place it at the expected path
 cp "$WORKER_SCRIPT" "$DUMP_DIR/criu_migrator.sh"
 
-# Save open files that CRIU will validate on restore (size must match exactly)
+# CRIU validates that files the process had open still exist at their original
+# paths AND have the exact same byte size. If the restore side just `touch`es
+# empty files, CRIU fails with "File ... has bad size 0 (expect N)".
+# Save the actual file contents so the restore side can copy them back.
 cp /tmp/criu-migrator-output.log "$DUMP_DIR/saved-output.log" 2>/dev/null || true
 cp "$COUNTER_FILE" "$DUMP_DIR/saved-counter" 2>/dev/null || true
 log "Saved open files for restore side (CRIU validates file sizes)"

@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
-# checkpoint_criu_restore.sh — Download a CRIU dump from another worker,
-# restore the process, and verify state continuity.
+# checkpoint_criu_restore.sh — CRIU cross-worker migration: RESTORE phase.
+#
+# Expects the dump directory (uploaded as artifact by the save job) to be
+# already downloaded at $RESULTS_DIR/criu-migration-dump/. The workflow
+# handles the artifact download before running this script.
+#
+# Restore steps:
+#   1. Read migration metadata to learn source host, counter value, PIDs
+#   2. Place the worker script at its original path (/tmp/criu_migrator.sh)
+#   3. Restore open files from saved copies (CRIU validates exact byte sizes)
+#   4. Kill any process occupying PIDs from the dump (core-*.img filenames)
+#   5. Attempt criu restore with progressively more permissive approaches:
+#      - Standard (--shell-job -d)
+#      - With --restore-sibling
+#      - In a new PID namespace (unshare --pid, without -d to keep namespace alive)
+#      - With --ext-unix-sk
+#      - With --tcp-established
+#   6. Verify state continuity: counter must advance beyond checkpoint value
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
@@ -53,7 +69,8 @@ bash "$SCRIPT_DIR/install_criu.sh"
 # ── Set up the worker script at the expected path ────────────────────
 section "Preparing restore environment"
 
-# The CRIU dump recorded the path of the binary. We must place it there.
+# CRIU recorded the absolute path of the executable in the dump images.
+# The binary must exist at the same path for restore to succeed.
 if [[ -f "$DUMP_DIR/criu_migrator.sh" ]]; then
   log "Installing worker script to $WORKER_SCRIPT"
   cp "$DUMP_DIR/criu_migrator.sh" "$WORKER_SCRIPT"
@@ -98,8 +115,10 @@ try_restore() {
   return $rc
 }
 
-# Kill any process using PIDs from the dump (cross-worker PID conflict is expected)
-# Extract PIDs from core-*.img filenames — these are the actual PIDs CRIU needs
+# CRIU restores the process tree at the exact PIDs from the dump. If any of
+# those PIDs are already in use on this worker, restore fails with
+# "Can't fork for <PID>: File exists". Extract PIDs from core-*.img filenames
+# (the authoritative source) and kill any conflicting processes.
 DUMP_PIDS=$(ls "$DUMP_DIR"/core-*.img 2>/dev/null | sed 's/.*core-//; s/\.img//' | sort -n)
 log "PIDs needed for restore: $DUMP_PIDS"
 for pid in $DUMP_PIDS; do
@@ -108,7 +127,7 @@ for pid in $DUMP_PIDS; do
     sudo kill -9 "$pid" 2>/dev/null || true
   fi
 done
-# Also kill the worker_pid from metadata (may differ from dump PIDs if setsid was used)
+# Also check the metadata worker_pid (may differ if save used setsid historically)
 ORIG_PID=$(python3 -c "import json; print(json.load(open('$DUMP_DIR/migration-meta.json'))['worker_pid'])" 2>/dev/null || echo "")
 if [[ -n "$ORIG_PID" ]] && kill -0 "$ORIG_PID" 2>/dev/null; then
   log "PID $ORIG_PID (metadata) is in use. Killing it."

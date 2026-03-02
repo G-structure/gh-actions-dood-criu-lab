@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# lib.sh — shared helpers for DOOD / CRIU test scripts
+# lib.sh — shared helpers sourced by all test and migration scripts.
+# Provides logging, retry with backoff, environment snapshot, JSON result
+# recording, markdown summary, and a cleanup trap system.
 set -euo pipefail
 
 # ── Directories ──────────────────────────────────────────────────────
