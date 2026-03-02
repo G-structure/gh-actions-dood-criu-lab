@@ -82,19 +82,49 @@ try_restore() {
   return $rc
 }
 
-# Approach 1: Standard restore with --shell-job -d (detached)
+# Kill any process using the original PID (cross-worker PID conflict is expected)
+ORIG_PID=$(python3 -c "import json; print(json.load(open('$DUMP_DIR/migration-meta.json'))['worker_pid'])" 2>/dev/null || echo "")
+if [[ -n "$ORIG_PID" ]] && kill -0 "$ORIG_PID" 2>/dev/null; then
+  log "PID $ORIG_PID is in use on this worker. Killing it to free the PID."
+  sudo kill -9 "$ORIG_PID" 2>/dev/null || true
+  sleep 1
+fi
+
+# Approach 1: Standard restore (may fail if PIDs conflict)
 if try_restore "standard" -D "$DUMP_DIR" --shell-job -v4 --log-file restore.log -d; then
   RESTORE_OK=true
 fi
 
-# Approach 2: With --ext-unix-sk
+# Approach 2: With --restore-sibling (avoids PID namespace issues)
+if [[ "$RESTORE_OK" != "true" ]]; then
+  if try_restore "with --restore-sibling" -D "$DUMP_DIR" --shell-job --restore-sibling -v4 --log-file restore.log -d; then
+    RESTORE_OK=true
+  fi
+fi
+
+# Approach 3: Restore into a new PID namespace (avoids PID conflicts entirely)
+if [[ "$RESTORE_OK" != "true" ]]; then
+  log "Trying restore in a new PID namespace (unshare) …"
+  UNSHARE_RC=0
+  sudo unshare --pid --fork --mount-proc criu restore \
+    -D "$DUMP_DIR" --shell-job -v4 --log-file restore.log -d 2>&1 \
+    | tee "$RESULTS_DIR/criu-cross-restore-attempt.log" || UNSHARE_RC=$?
+  if [[ $UNSHARE_RC -eq 0 ]]; then
+    RESTORE_OK=true
+    log "Restore in new PID namespace succeeded."
+  else
+    warn "Restore in new PID namespace failed (exit $UNSHARE_RC)."
+  fi
+fi
+
+# Approach 4: With --ext-unix-sk
 if [[ "$RESTORE_OK" != "true" ]]; then
   if try_restore "with --ext-unix-sk" -D "$DUMP_DIR" --shell-job --ext-unix-sk -v4 --log-file restore.log -d; then
     RESTORE_OK=true
   fi
 fi
 
-# Approach 3: With --tcp-established
+# Approach 5: With --tcp-established
 if [[ "$RESTORE_OK" != "true" ]]; then
   if try_restore "with --tcp-established" -D "$DUMP_DIR" --shell-job --tcp-established -v4 --log-file restore.log -d; then
     RESTORE_OK=true
