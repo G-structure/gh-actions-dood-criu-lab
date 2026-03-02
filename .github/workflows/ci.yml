@@ -1,0 +1,126 @@
+name: DOOD & CRIU Lab
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: 'Fail workflow if any test fails'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare results directory
+        run: |
+          mkdir -p results
+          echo "# Test Results — $(date -u)" > results/summary.md
+          echo "" >> results/summary.md
+          echo "| Test | Result | Details |" >> results/summary.md
+          echo "|------|--------|---------|" >> results/summary.md
+          echo '[]' > results/results.json
+
+      - name: Make scripts executable
+        run: chmod +x scripts/*.sh
+
+      # ── DOOD Test ───────────────────────────────────────────────
+      - name: "Test: Docker-out-of-Docker (DOOD)"
+        id: dood
+        run: bash scripts/test_dood.sh
+        continue-on-error: true
+
+      # ── CRIU Process Test ───────────────────────────────────────
+      - name: "Test: CRIU Process Checkpoint/Restore"
+        id: criu_process
+        run: bash scripts/test_criu_process.sh
+        continue-on-error: true
+
+      # ── Docker Checkpoint Test ──────────────────────────────────
+      - name: "Test: Docker Checkpoint/Restore"
+        id: docker_checkpoint
+        run: bash scripts/test_docker_checkpoint.sh
+        continue-on-error: true
+
+      # ── Collect debug info on any failure ───────────────────────
+      - name: Collect debug info
+        if: always()
+        run: |
+          echo "=== Debug info ===" | tee results/debug.log
+          echo "--- uname -a ---" | tee -a results/debug.log
+          uname -a | tee -a results/debug.log
+          echo "--- /etc/os-release ---" | tee -a results/debug.log
+          cat /etc/os-release | tee -a results/debug.log
+          echo "--- docker version ---" | tee -a results/debug.log
+          docker version 2>&1 | tee -a results/debug.log || true
+          echo "--- docker info ---" | tee -a results/debug.log
+          docker info 2>&1 | tee -a results/debug.log || true
+          echo "--- lsmod (checkpoint related) ---" | tee -a results/debug.log
+          lsmod 2>/dev/null | head -30 | tee -a results/debug.log || true
+          echo "--- /proc/config.gz check ---" | tee -a results/debug.log
+          if [[ -f /proc/config.gz ]]; then
+            zcat /proc/config.gz | grep -i checkpoint | tee -a results/debug.log || true
+          else
+            echo "/proc/config.gz not available" | tee -a results/debug.log
+          fi
+
+      # ── Summary ─────────────────────────────────────────────────
+      - name: Generate job summary
+        if: always()
+        run: |
+          {
+            echo "## DOOD & CRIU Lab Results — ${{ matrix.os }}"
+            echo ""
+            echo "| Test | Result | Details |"
+            echo "|------|--------|---------|"
+
+            # Read from results.json
+            if command -v jq &>/dev/null && [[ -f results/results.json ]]; then
+              jq -r '.[] | "| \(.test) | \(.status) | \(.message) |"' results/results.json
+            else
+              echo "| (results) | ? | Could not parse results.json |"
+            fi
+
+            echo ""
+            echo "### Environment"
+            echo '```'
+            echo "Runner: ${{ matrix.os }}"
+            uname -a
+            docker --version 2>/dev/null || echo "docker not available"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Upload artifacts ────────────────────────────────────────
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.os }}
+          path: results/
+          retention-days: 30
+
+      # ── Strict mode check ──────────────────────────────────────
+      - name: Check strict mode
+        if: always() && inputs.strict == 'true'
+        run: |
+          if [[ "${{ steps.dood.outcome }}" == "failure" ]] || \
+             [[ "${{ steps.criu_process.outcome }}" == "failure" ]] || \
+             [[ "${{ steps.docker_checkpoint.outcome }}" == "failure" ]]; then
+            echo "::error::One or more tests failed and strict mode is enabled."
+            exit 1
+          fi
