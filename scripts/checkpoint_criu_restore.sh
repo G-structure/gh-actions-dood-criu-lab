@@ -68,6 +68,12 @@ fi
 # writes its OWN counter (continuing from checkpoint, not starting fresh)
 rm -f "$COUNTER_FILE"
 
+# CRIU requires that files the process had open exist at their original paths.
+# The save-side process had /tmp/criu-migrator-output.log open as stdout/stderr.
+touch /tmp/criu-migrator-output.log
+# Also ensure the counter file path is writable (CRIU will reopen it)
+touch "$COUNTER_FILE"
+
 # ── Attempt CRIU restore ─────────────────────────────────────────────
 section "Restoring process from checkpoint"
 
