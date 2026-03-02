@@ -57,6 +57,11 @@ jobs:
         run: bash scripts/test_docker_checkpoint.sh
         continue-on-error: true
 
+      # ── Fix permissions for artifact upload ──────────────────────
+      - name: Fix results directory permissions
+        if: always()
+        run: sudo chmod -R a+rX results/ 2>/dev/null || true
+
       # ── Collect debug info on any failure ───────────────────────
       - name: Collect debug info
         if: always()
